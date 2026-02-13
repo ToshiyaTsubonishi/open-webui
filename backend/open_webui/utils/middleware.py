@@ -3,6 +3,7 @@ import logging
 import sys
 import os
 import base64
+import mimetypes
 import textwrap
 
 import asyncio
@@ -29,6 +30,7 @@ from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.models.chats import Chats
 from open_webui.models.folders import Folders
 from open_webui.models.users import Users
+from open_webui.models.files import Files
 from open_webui.socket.main import (
     get_event_call,
     get_event_emitter,
@@ -109,6 +111,7 @@ from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.response import normalize_usage
 from open_webui.utils.mcp.client import MCPClient
+from open_webui.storage.provider import Storage
 
 
 from open_webui.config import (
@@ -152,9 +155,250 @@ DEFAULT_SOLUTION_TAGS = [("<|begin_of_solution|>", "<|end_of_solution|>")]
 DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 
 
+def _safe_env_int(env_key: str, default_value: int) -> int:
+    try:
+        return int(os.environ.get(env_key, str(default_value)))
+    except (TypeError, ValueError):
+        return default_value
+
+
+MEDIA_CONTEXT_MAX_FILE_BYTES = max(
+    _safe_env_int("MCP_ROUTER_MEDIA_CONTEXT_MAX_FILE_BYTES", 75 * 1024 * 1024),
+    0,
+)
+IMAGE_FILE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tif",
+    ".tiff",
+}
+AUDIO_FILE_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".webm",
+    ".mp4",
+}
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
 def output_id(prefix: str) -> str:
     """Generate OR-style ID: prefix + 24-char hex UUID."""
     return f"{prefix}_{uuid4().hex[:24]}"
+
+
+def _extract_file_id_from_url(url: str) -> Optional[str]:
+    if not isinstance(url, str) or not url:
+        return None
+    if UUID_PATTERN.match(url):
+        return url
+    m = re.search(r"/api/v1/files/([0-9a-f-]{36})/content", url, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _get_file_id_from_item(file_item: dict) -> Optional[str]:
+    file_id = file_item.get("id")
+    if isinstance(file_id, str) and file_id:
+        return file_id
+
+    nested_file_id = file_item.get("file", {}).get("id")
+    if isinstance(nested_file_id, str) and nested_file_id:
+        return nested_file_id
+
+    return _extract_file_id_from_url(file_item.get("url", ""))
+
+
+def _get_file_name_from_item(file_item: dict) -> str:
+    for candidate in [
+        file_item.get("name"),
+        file_item.get("filename"),
+        file_item.get("file", {}).get("filename"),
+        file_item.get("file", {}).get("meta", {}).get("name"),
+    ]:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return ""
+
+
+def _get_file_content_type(file_item: dict) -> str:
+    for candidate in [
+        file_item.get("content_type"),
+        file_item.get("meta", {}).get("content_type"),
+        file_item.get("file", {}).get("meta", {}).get("content_type"),
+    ]:
+        if isinstance(candidate, str) and candidate:
+            return candidate
+
+    name = _get_file_name_from_item(file_item)
+    if name:
+        guessed, _ = mimetypes.guess_type(name)
+        if guessed:
+            return guessed
+
+    return ""
+
+
+def _is_image_file(file_item: dict, content_type: str) -> bool:
+    item_type = file_item.get("type", "")
+    if item_type == "image":
+        return True
+    if content_type.startswith("image/"):
+        return True
+    name = _get_file_name_from_item(file_item).lower()
+    return any(name.endswith(ext) for ext in IMAGE_FILE_EXTENSIONS)
+
+
+def _is_audio_file(file_item: dict, content_type: str) -> bool:
+    item_type = file_item.get("type", "")
+    if item_type == "audio":
+        return True
+    if content_type.startswith("audio/"):
+        return True
+    name = _get_file_name_from_item(file_item).lower()
+    return any(name.endswith(ext) for ext in AUDIO_FILE_EXTENSIONS)
+
+
+def _is_external_http_url(url: Optional[str]) -> bool:
+    return isinstance(url, str) and (
+        url.startswith("http://") or url.startswith("https://")
+    )
+
+
+def _to_data_url_by_file_id(
+    file_id: Optional[str], content_type: str, fallback_name: str = ""
+) -> Optional[str]:
+    if not file_id:
+        return None
+
+    file_obj = Files.get_file_by_id(file_id)
+    if not file_obj or not file_obj.path:
+        return None
+
+    try:
+        file_path = Storage.get_file(file_obj.path)
+        if not file_path or not os.path.isfile(file_path):
+            return None
+
+        file_size = os.path.getsize(file_path)
+        if MEDIA_CONTEXT_MAX_FILE_BYTES and file_size > MEDIA_CONTEXT_MAX_FILE_BYTES:
+            log.info(
+                "Skipping media context base64 injection for file %s: size=%s exceeds max=%s bytes",
+                file_id,
+                file_size,
+                MEDIA_CONTEXT_MAX_FILE_BYTES,
+            )
+            return None
+
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        mime_type = (
+            content_type
+            or ((file_obj.meta or {}).get("content_type") if file_obj.meta else "")
+            or mimetypes.guess_type(file_obj.filename or fallback_name or "")[0]
+            or "application/octet-stream"
+        )
+        encoded = base64.b64encode(data).decode("utf-8")
+        return f"data:{mime_type};base64,{encoded}"
+    except Exception as e:
+        log.debug(f"Failed to build data URL for file {file_id}: {e}")
+        return None
+
+
+def build_route_prompt_media_context(files: list[dict]) -> dict[str, str]:
+    """
+    Build media context for mcp-router route_prompt from attached files.
+
+    - External URLs are passed as image_url/audio_url.
+    - Local files are embedded as image_base64/audio_base64 to avoid auth/network issues.
+    """
+    context: dict[str, str] = {}
+    if not isinstance(files, list):
+        return context
+
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            continue
+
+        content_type = _get_file_content_type(file_item)
+        is_image = _is_image_file(file_item, content_type)
+        is_audio = _is_audio_file(file_item, content_type)
+        if not is_image and not is_audio:
+            continue
+
+        file_url = file_item.get("url")
+        file_id = _get_file_id_from_item(file_item)
+        file_name = _get_file_name_from_item(file_item)
+
+        if is_image and "image_url" not in context and "image_base64" not in context:
+            if _is_external_http_url(file_url):
+                context["image_url"] = file_url
+            else:
+                image_b64 = _to_data_url_by_file_id(file_id, content_type, file_name)
+                if image_b64:
+                    context["image_base64"] = image_b64
+
+        if is_audio and "audio_url" not in context and "audio_base64" not in context:
+            if _is_external_http_url(file_url):
+                context["audio_url"] = file_url
+            else:
+                audio_b64 = _to_data_url_by_file_id(file_id, content_type, file_name)
+                if audio_b64:
+                    context["audio_base64"] = audio_b64
+
+        if (
+            ("image_url" in context or "image_base64" in context)
+            and ("audio_url" in context or "audio_base64" in context)
+        ):
+            break
+
+    return context
+
+
+def inject_media_context_for_route_prompt(
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_type: str,
+    metadata: dict,
+) -> dict:
+    if tool_type != "mcp":
+        return tool_function_params
+
+    if not isinstance(tool_function_params, dict):
+        return tool_function_params
+
+    if tool_function_name != "route_prompt" and not tool_function_name.endswith(
+        "_route_prompt"
+    ):
+        return tool_function_params
+
+    files = (metadata or {}).get("files", [])
+    media_context = build_route_prompt_media_context(files)
+    if not media_context:
+        return tool_function_params
+
+    existing_context = tool_function_params.get("context", {})
+    if not isinstance(existing_context, dict):
+        existing_context = {}
+
+    for key, value in media_context.items():
+        existing_context.setdefault(key, value)
+
+    tool_function_params["context"] = existing_context
+    return tool_function_params
 
 
 def get_citation_source_from_tool_result(
@@ -1077,6 +1321,12 @@ async def chat_completion_tools_handler(
                     spec = tool.get("spec", {})
                     allowed_params = (
                         spec.get("parameters", {}).get("properties", {}).keys()
+                    )
+                    tool_function_params = inject_media_context_for_route_prompt(
+                        tool_function_name=tool_function_name,
+                        tool_function_params=tool_function_params,
+                        tool_type=tool_type,
+                        metadata=metadata,
                     )
                     tool_function_params = {
                         k: v
@@ -3896,6 +4146,12 @@ async def streaming_chat_response_handler(response, ctx):
                                     spec.get("parameters", {})
                                     .get("properties", {})
                                     .keys()
+                                )
+                                tool_function_params = inject_media_context_for_route_prompt(
+                                    tool_function_name=tool_function_name,
+                                    tool_function_params=tool_function_params,
+                                    tool_type=tool_type,
+                                    metadata=metadata,
                                 )
 
                                 tool_function_params = {
